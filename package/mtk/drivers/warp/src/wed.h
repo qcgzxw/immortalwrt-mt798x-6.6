@@ -91,6 +91,7 @@ struct wed_bm_group_info {
  * token_id: used as token id or skb id
  */
 struct wed_pkt_info {
+	u32 token_id;
 	u32 len;
 	u32 desc_len;
 	u32 fd_len;

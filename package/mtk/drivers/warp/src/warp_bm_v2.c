@@ -186,6 +186,7 @@ grp_info_alloc(
 		}
 
 		memset(info, 0, sizeof(struct wed_pkt_info));
+		info->token_id = res->token_start + i;
 		info->len = res->pkt_len;
 		/*allocate skb*/
 
@@ -1919,4 +1920,3 @@ err:
 	wed_rx_bm_exit(wed);
 	return ret;
 }
-

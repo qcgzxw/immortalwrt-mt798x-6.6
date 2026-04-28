@@ -661,7 +661,8 @@ int wed_fdesc_init(
 		WRITE_ONCE(txdma->ctrl, cpu_to_le32(ctrl));
 		WRITE_ONCE(txdma->sdp0, cpu_to_le32(info->fdesc_pa));
 		WRITE_ONCE(txdma->sdp1, cpu_to_le32(info->pkt_pa));
-		wifi->ops->fbuf_init((unsigned char *)info->fdesc_va, txdma->sdp1, 0);
+		wifi->ops->fbuf_init((unsigned char *)info->fdesc_va, txdma->sdp1,
+				     info->token_id);
 
 		ret = 0;
 	}
@@ -1176,4 +1177,3 @@ void wed_procinfo_dump(struct wed_entry *wed, struct seq_file *seq, int idx)
 		}
 	}
 }
-
