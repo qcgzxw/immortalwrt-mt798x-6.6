@@ -29,6 +29,7 @@
 
 #define WED_DYNBM_LOW_GRP			2
 #define WED_DYNBM_HIGH_GRP			(2*WED_DYNBM_LOW_GRP-1)
+#define WED_INVALID_TOKEN_ID		0xffffffff
 
 #define WED_PKT_NUM_GET(_wed) (_wed->res_ctrl.tx_ctrl.res.pkt_num)
 #define WED_TOKEN_NUM_GET(_wed) (_wed->res_ctrl.tx_ctrl.res.token_num)
@@ -118,6 +119,7 @@ struct wed_dybm_stat_t {
 	u32 min_vld_grp;
 	bool off_low_buf_int;
 	bool off_high_buf_int;
+	bool near_full_warned;
 };
 
 struct wed_buf_res {

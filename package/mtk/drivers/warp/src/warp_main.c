@@ -410,7 +410,11 @@ warp_probe(struct platform_device *pdev)
 	wed = &warp->wed;
 	wed->warp = warp;
 	wed->sw_conf = &warp_ctrl->sw_conf[warp->idx];
-	wed_init(pdev, warp->idx, wed);
+	ret = wed_init(pdev, warp->idx, wed);
+	if (ret < 0) {
+		warp_dbg(WARP_DBG_ERR, "%s(): wed init failed\n", __func__);
+		return ret;
+	}
 	wed_entry_proc_init(warp, wed);
 #ifdef WED_RX_D_SUPPORT
 	rxbm_proc_init(warp, wed);
@@ -1494,7 +1498,11 @@ warp_gen4m_resume_sub(struct warp_entry *warp)
 	wed = &warp->wed;
 	wed->warp = warp;
 	wed->sw_conf = &warp_ctrl->sw_conf[warp->idx];
-	wed_init(pdev, warp->idx, wed);
+	ret = wed_init(pdev, warp->idx, wed);
+	if (ret < 0) {
+		warp_dbg(WARP_DBG_ERR, "%s(): wed init failed\n", __func__);
+		return ret;
+	}
 	wed_entry_proc_init(warp, wed);
 #ifdef WED_RX_D_SUPPORT
 	rxbm_proc_init(warp, wed);
@@ -1763,4 +1771,3 @@ module_exit(warp_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION(DRIVER_DESC);
-

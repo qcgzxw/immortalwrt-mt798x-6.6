@@ -22,6 +22,71 @@ struct dybm_ul_tasks {
 	struct tasklet_struct rbuf_free_task;
 };
 
+static u32 wed_txbm_token_grp_cap(struct wed_buf_res *res)
+{
+	if (unlikely(!res->tkn_grp_sz))
+		return 0;
+
+	return res->token_num / res->tkn_grp_sz;
+}
+
+static void wed_txbm_warn_near_full(struct wed_entry *wed)
+{
+	struct wed_buf_res *res = &wed->res_ctrl.tx_ctrl.res;
+	u32 warn_threshold;
+
+	if (!res->token_num)
+		return;
+
+	warn_threshold = (res->token_num * 95) / 100;
+
+	if (!res->dybm_stat.near_full_warned && res->pkt_num >= warn_threshold) {
+		warp_dbg(WARP_DBG_ERR,
+			 "%s(): WARP TX buffer near exhaustion (pkt=%u token=%u)\n",
+			 __func__, res->pkt_num, res->token_num);
+		res->dybm_stat.near_full_warned = true;
+	} else if (res->dybm_stat.near_full_warned && res->pkt_num < warn_threshold)
+		res->dybm_stat.near_full_warned = false;
+}
+
+static void wed_txbm_sync_pkt_num(struct wed_buf_res *res)
+{
+	res->pkt_num = (res->bm_vld_grp + res->budget_grp) * res->bm_grp_sz;
+}
+
+static int wed_txbm_sanity_check(struct wed_entry *wed, const char *stage)
+{
+	struct wed_buf_res *res = &wed->res_ctrl.tx_ctrl.res;
+	u32 token_grp_cap, token_remainder;
+
+	if (!res->token_num || !res->bm_grp_sz || !res->tkn_grp_sz) {
+		warp_dbg(WARP_DBG_ERR, "%s(): invalid TXBM geometry at %s\n", __func__, stage);
+		return -1;
+	}
+
+	token_grp_cap = wed_txbm_token_grp_cap(res);
+	token_remainder = res->token_num % res->tkn_grp_sz;
+	if (!token_grp_cap) {
+		warp_dbg(WARP_DBG_ERR, "%s(): token groups unavailable at %s\n",
+			 __func__, stage);
+		return -1;
+	}
+
+	if (res->bm_rsv_grp > res->bm_vld_grp || res->bm_vld_grp > res->bm_max_grp ||
+	    res->bm_max_grp > token_grp_cap || res->tkn_rsv_grp > token_grp_cap ||
+	    res->tkn_vld_grp > token_grp_cap || res->pkt_num > res->token_num) {
+		warp_dbg(WARP_DBG_ERR,
+			 "%s(): sanity check failed at %s (rsv=%u vld=%u max=%u tkn_rsv=%u tkn_vld=%u pkt=%u token=%u cap=%u rem=%u dybm=%u alt=%u budget=%u)\n",
+			 __func__, stage, res->bm_rsv_grp, res->bm_vld_grp, res->bm_max_grp,
+			 res->tkn_rsv_grp, res->tkn_vld_grp, res->pkt_num, res->token_num,
+			 token_grp_cap, token_remainder, wed->sw_conf->txbm.enable,
+			 wed->sw_conf->txbm.alt_quota, wed->sw_conf->txbm.budget_limit);
+		return -1;
+	}
+
+	return 0;
+}
+
 /*
 *
 */
@@ -115,7 +180,8 @@ grp_buf_init(
 
 		if (info) {
 			/*init firt buf with MAC TXD+CR4 TXP*/
-			wed_fdesc_init(wed, info);
+			if (wed_fdesc_init(wed, info) < 0)
+				return -1;
 		}
 	}
 
@@ -175,6 +241,14 @@ grp_info_alloc(
 	struct wed_pkt_info *info;
 	struct platform_device *pdev = wed->pdev;
 
+	if (unlikely(start >= res->token_num || size > (res->token_num - start))) {
+		WARN_ONCE(1, "WARP: token range allocation out of bounds\n");
+		warp_dbg(WARP_DBG_ERR,
+			 "%s(): invalid token range start=%u size=%u token_num=%u\n",
+			 __func__, start, size, res->token_num);
+		goto err;
+	}
+
 	/*prepare info and add to list */
 	for (i = start; i < end; i++) {
 		/*allocate token info*/
@@ -187,6 +261,14 @@ grp_info_alloc(
 
 		memset(info, 0, sizeof(struct wed_pkt_info));
 		info->token_id = res->token_start + i;
+		if (unlikely(info->token_id > res->token_end)) {
+			WARN_ONCE(1, "WARP: token id allocation out of bounds\n");
+			warp_dbg(WARP_DBG_ERR,
+				 "%s(): allocate invalid token id=%u token_end=%u\n",
+				 __func__, info->token_id, res->token_end);
+			warp_os_free_mem(info);
+			goto err;
+		}
 		info->len = res->pkt_len;
 		/*allocate skb*/
 
@@ -337,8 +419,10 @@ bm_init_all(struct wed_entry *wed, struct wed_buf_res *res)
 		grp_info->skb_id_start = i*res->bm_grp_sz;
 		INIT_LIST_HEAD(&grp_info->pkt_head);
 
-		if (grp_info_alloc(wed, res, grp_info->skb_id_start, res->bm_grp_sz, &grp_info->pkt_head) < 0)
+		if (grp_info_alloc(wed, res, grp_info->skb_id_start, res->bm_grp_sz, &grp_info->pkt_head) < 0) {
+			warp_os_free_mem(grp_info);
 			goto err;
+		}
 
 		list_add(&grp_info->list, &res->grp_head);
 
@@ -348,13 +432,17 @@ bm_init_all(struct wed_entry *wed, struct wed_buf_res *res)
 	list_for_each_safe(cur, next, &res->grp_head) {
 		struct wed_bm_group_info *grp_info = list_entry(cur, struct wed_bm_group_info, list);
 
-		grp_buf_init(wed, res, &grp_info->pkt_head);
+		if (grp_buf_init(wed, res, &grp_info->pkt_head) < 0)
+			goto err;
 	}
 
 	INIT_LIST_HEAD(&res->budget_head);
 #ifdef WED_DYNAMIC_TXBM_SUPPORT
 	if (IS_WED_HW_CAP(wed, WED_HW_CAP_DYN_TXBM)) {
-		for (; i < res->bm_vld_grp + wed->sw_conf->txbm.budget_limit; i++) {
+		u32 budget_end = min_t(u32, res->bm_max_grp,
+				       res->bm_vld_grp + wed->sw_conf->txbm.budget_limit);
+
+		for (; i < budget_end; i++) {
 			struct wed_bm_group_info *grp_info = NULL;
 
 			warp_os_alloc_mem((unsigned char **)&grp_info, sizeof(struct wed_bm_group_info), GFP_ATOMIC);
@@ -367,23 +455,28 @@ bm_init_all(struct wed_entry *wed, struct wed_buf_res *res)
 			grp_info->skb_id_start = i*res->bm_grp_sz;
 			INIT_LIST_HEAD(&grp_info->pkt_head);
 
-			if (grp_info_alloc(wed, res, grp_info->skb_id_start, res->bm_grp_sz, &grp_info->pkt_head) < 0)
+			if (grp_info_alloc(wed, res, grp_info->skb_id_start, res->bm_grp_sz, &grp_info->pkt_head) < 0) {
+				warp_os_free_mem(grp_info);
 				goto err;
+			}
 
 			list_add_tail(&grp_info->list, &res->budget_head);
 			warp_dbg(WARP_DBG_INF, "%s(): Append grp of %u to budge!\n", __func__, grp_info->skb_id_start);
 
 			res->budget_grp++;
 		}
-		res->pkt_num += res->budget_grp * res->bm_grp_sz;
+		wed_txbm_sync_pkt_num(res);
 
 		list_for_each_safe(cur, next, &res->budget_head) {
 			struct wed_bm_group_info *grp_info = list_entry(cur, struct wed_bm_group_info, list);
 
-			grp_buf_init(wed, res, &grp_info->pkt_head);
+			if (grp_buf_init(wed, res, &grp_info->pkt_head) < 0)
+				goto err;
 		}
 	}
 #endif	/* WED_DYNAMIC_TXBM_SUPPORT */
+
+	wed_txbm_sync_pkt_num(res);
 
 	return 0;
 
@@ -398,7 +491,7 @@ err:
 static void
 tbudge_refill_handler(unsigned long data)
 {
-	u32 i = 0, quota = 0;
+	u32 i = 0, quota = 0, start_grp;
 	struct wed_entry *wed = (struct wed_entry *)data;
 	struct wed_buf_res *res = &wed->res_ctrl.tx_ctrl.res;
 #ifdef WARP_DVT
@@ -410,8 +503,10 @@ tbudge_refill_handler(unsigned long data)
 	else
 		goto err;
 
-	for (i = res->pkt_num/res->bm_grp_sz ;
-		 (i < (res->pkt_num/res->bm_grp_sz) + quota) && (i < res->bm_max_grp);
+	start_grp = res->bm_vld_grp + res->budget_grp;
+
+	for (i = start_grp;
+		 (i < start_grp + quota) && (i < res->bm_max_grp);
 		 i++) {
 		struct wed_bm_group_info *grp_info = NULL;
 
@@ -426,8 +521,14 @@ tbudge_refill_handler(unsigned long data)
 			if (grp_info_alloc(wed, res, grp_info->skb_id_start, res->bm_grp_sz, &grp_info->pkt_head) < 0) {
 				res->dybm_stat.budget_refill_failed++;
 				warp_dbg(WARP_DBG_ERR, "%s(): allocate packet %d info fail!\n", __func__, i);
+				warp_os_free_mem(grp_info);
 			} else {
-				grp_buf_init(wed, res, &grp_info->pkt_head);
+				if (grp_buf_init(wed, res, &grp_info->pkt_head) < 0) {
+					res->dybm_stat.budget_refill_failed++;
+					grp_info_free(wed, res, &grp_info->pkt_head);
+					warp_os_free_mem(grp_info);
+					continue;
+				}
 
 				list_add_tail(&grp_info->list, &res->budget_head);
 				warp_dbg(WARP_DBG_INF, "%s(): budge extend with group %u!\n", __func__, grp_info->skb_id_start);
@@ -441,8 +542,10 @@ err:
 	after = sched_clock();
 #endif	/* WARP_DVT */
 	if (quota) {
-		res->dybm_stat.budget_refill += (i-res->pkt_num/res->bm_grp_sz);
-		res->pkt_num += (i-res->pkt_num/res->bm_grp_sz)*res->bm_grp_sz;
+		res->dybm_stat.budget_refill += (i - start_grp);
+		wed_txbm_sync_pkt_num(res);
+		wed_txbm_warn_near_full(wed);
+		wed_txbm_sanity_check(wed, "tbudge_refill");
 		warp_dbg(WARP_DBG_INF, "%s(): Enlarge %d group(s)!\n", __func__, quota);
 #ifdef WARP_DVT
 		warp_dbg(WARP_DBG_OFF, "%s(): process time: %ld us\n", __func__, (after-now)/1000);
@@ -461,24 +564,27 @@ tbudge_release_handler(unsigned long data)
 	u32 quota = 0;
 	struct wed_entry *wed = (struct wed_entry *)data;
 	struct wed_buf_res *res = &wed->res_ctrl.tx_ctrl.res;
-	struct wed_bm_group_info *grp_info = list_last_entry(&res->budget_head, struct wed_bm_group_info, list);
+	struct wed_bm_group_info *grp_info = NULL;
 
 	if (res->budget_grp > wed->sw_conf->txbm.budget_limit) {
 		quota = res->budget_grp - wed->sw_conf->txbm.budget_limit;
 		res->dybm_stat.budget_release += quota;
-		res->pkt_num -= quota*res->bm_grp_sz;
 
 		warp_dbg(WARP_DBG_INF, "%s(): Release %d group(s)!\n", __func__, quota);
 	}
 
-	while(quota > 0 && grp_info != NULL) {
-			list_del(&grp_info->list);
-			grp_info_free(wed, res, &grp_info->pkt_head);
-			warp_os_free_mem(grp_info);
-			res->budget_grp--;
-			quota--;
-			grp_info = list_last_entry(&res->budget_head, struct wed_bm_group_info, list);
+	while (quota > 0 && !list_empty(&res->budget_head)) {
+		grp_info = list_last_entry(&res->budget_head, struct wed_bm_group_info, list);
+		list_del(&grp_info->list);
+		grp_info_free(wed, res, &grp_info->pkt_head);
+		warp_os_free_mem(grp_info);
+		res->budget_grp--;
+		quota--;
 	}
+
+	wed_txbm_sync_pkt_num(res);
+	wed_txbm_warn_near_full(wed);
+	wed_txbm_sanity_check(wed, "tbudge_release");
 }
 
 /*
@@ -490,24 +596,25 @@ bm_buf_extend(struct wed_entry *wed, u32 grp_num)
 	int ret = -1;
 	struct wed_tx_ctrl *tx_ctrl = &wed->res_ctrl.tx_ctrl;
 	struct wed_buf_res *res = &tx_ctrl->res;
-	struct wed_bm_group_info *grp_info = list_first_entry(&res->budget_head, struct wed_bm_group_info, list);
+	struct wed_bm_group_info *grp_info = NULL;
 
 	if (!list_empty(&res->budget_head)) {
 		warp_dbg(WARP_DBG_INF, "%s(): Occupy %d group(s) from budge!\n", __func__, grp_num);
 
-		while (grp_num > 0 && grp_info != NULL) {
+		while (grp_num > 0 && !list_empty(&res->budget_head)) {
+			grp_info = list_first_entry(&res->budget_head, struct wed_bm_group_info, list);
 			list_move(&grp_info->list, &res->grp_head);
 			grp_num--;
 			res->bm_vld_grp++;
 			res->budget_grp--;
-			grp_info = list_first_entry(&res->budget_head, struct wed_bm_group_info, list);
-
 		}
 
 		if (res->bm_vld_grp > res->dybm_stat.max_vld_grp)
 			res->dybm_stat.max_vld_grp = res->bm_vld_grp;
 
 		wed->tbuf_alloc_times++;
+		wed_txbm_sync_pkt_num(res);
+		wed_txbm_warn_near_full(wed);
 
 		ret = 0;
 	}
@@ -523,17 +630,16 @@ bm_buf_reduce(struct wed_entry *wed, u32 grp_num)
 {
 	struct wed_tx_ctrl *tx_ctrl = &wed->res_ctrl.tx_ctrl;
 	struct wed_buf_res *res = &tx_ctrl->res;
-	struct wed_bm_group_info *grp_info = list_first_entry(&res->grp_head, struct wed_bm_group_info, list);
+	struct wed_bm_group_info *grp_info = NULL;
 
 	warp_dbg(WARP_DBG_INF, "%s(): Recycle %d group(s) from budge!\n", __func__, grp_num);
 
-	while (grp_num > 0 && grp_info != NULL) {
-
+	while (grp_num > 0 && !list_empty(&res->grp_head)) {
+		grp_info = list_first_entry(&res->grp_head, struct wed_bm_group_info, list);
 		list_move(&grp_info->list, &res->budget_head);
 		grp_num--;
 		res->bm_vld_grp--;
 		res->budget_grp++;
-		grp_info = list_first_entry(&res->grp_head, struct wed_bm_group_info, list);
 		warp_dbg(WARP_DBG_INF, "%s(): Recycle grp of %u to budge pool!\n", __func__, grp_info->skb_id_start);
 	}
 
@@ -543,6 +649,8 @@ bm_buf_reduce(struct wed_entry *wed, u32 grp_num)
 		res->dybm_stat.min_vld_grp = res->bm_vld_grp;
 
 	wed->tbuf_free_times++;
+	wed_txbm_sync_pkt_num(res);
+	wed_txbm_warn_near_full(wed);
 }
 
 /*
@@ -611,7 +719,7 @@ buf_alloc_task(unsigned long data)
 {
 	struct wed_entry *wed = (struct wed_entry *)data;
 	struct wed_buf_res *res = &wed->res_ctrl.tx_ctrl.res;
-	u32 tkn_quota = 0, value= 0;
+	u32 tkn_quota = 0, value= 0, token_grp_cap, tkn_ext_grp = 0;
 
 	value = warp_get_recycle_grp_idx(wed);
 	if (res->recycle_grp_idx == value) {
@@ -627,18 +735,13 @@ buf_alloc_task(unsigned long data)
 		if (bm_buf_extend(wed, wed->sw_conf->txbm.alt_quota) == 0) {
 			warp_bfm_update_hw(wed, false);
 
-			tkn_quota = (res->token_num - (res->tkn_vld_grp*res->tkn_grp_sz));
+			token_grp_cap = wed_txbm_token_grp_cap(res);
+			if (res->tkn_vld_grp < token_grp_cap)
+				tkn_ext_grp = min_t(u32, wed->sw_conf->txbm.alt_quota,
+						 token_grp_cap - res->tkn_vld_grp);
 
-			if (tkn_quota) {
-				u32 tkn_ext_grp = 0;
-
-				if (tkn_quota >= wed->sw_conf->txbm.alt_quota*res->tkn_grp_sz) {
-					tkn_ext_grp = wed->sw_conf->txbm.alt_quota;
-					tkn_quota = wed->sw_conf->txbm.alt_quota*res->tkn_grp_sz;
-				} else if (tkn_quota) {
-					tkn_ext_grp = (tkn_quota/res->tkn_grp_sz) + ((tkn_quota%res->tkn_grp_sz) ? 1 : 0);
-				}
-
+			if (tkn_ext_grp) {
+				tkn_quota = tkn_ext_grp * res->tkn_grp_sz;
 				res->tkn_vld_grp += tkn_ext_grp;
 				warp_btkn_update_hw(wed, false);
 
@@ -658,6 +761,8 @@ buf_alloc_task(unsigned long data)
 				} else
 					warp_dbg(WARP_DBG_ERR, "%s(): empty tasks! dismissed!\n", __func__);
 			}
+
+			wed_txbm_sanity_check(wed, "buf_alloc");
 		} else {
 			warp_dbg(WARP_DBG_ERR, "%s(): BM size remain:%d due to budge being exhausted!\n",
 					 __func__, res->pkt_num);
@@ -686,43 +791,43 @@ token_alloc_task(unsigned long data)
 	struct wed_entry *wed = (struct wed_entry *)data;
 	struct wed_buf_res *res = &wed->res_ctrl.tx_ctrl.res;
 	u32 size = 0;
-	u32 buf_lmt = 0, tkn_quota = 0;
+	u32 buf_lmt = 0, tkn_quota = 0, token_grp_cap, tkn_ext_grp = 0, bm_ext_grp = 0;
 	unsigned long now = jiffies;
 
-	tkn_quota = (res->token_num - (res->tkn_vld_grp*res->tkn_grp_sz));
+	token_grp_cap = wed_txbm_token_grp_cap(res);
+	if (res->tkn_vld_grp < token_grp_cap)
+		tkn_ext_grp = min_t(u32, wed->sw_conf->txbm.alt_quota,
+				 token_grp_cap - res->tkn_vld_grp);
 
-	if (tkn_quota) {
-		u32 tkn_ext_grp = 0;
-
-		if (tkn_quota >= wed->sw_conf->txbm.alt_quota*res->tkn_grp_sz) {
-			tkn_ext_grp = wed->sw_conf->txbm.alt_quota;
-			tkn_quota = wed->sw_conf->txbm.alt_quota*res->tkn_grp_sz;
-		} else if (tkn_quota) {
-			tkn_ext_grp = (tkn_quota/res->tkn_grp_sz) + ((tkn_quota%res->tkn_grp_sz) ? 1 : 0);
-		}
-
-		res->tkn_vld_grp += tkn_ext_grp;
+	if (tkn_ext_grp) {
+		tkn_quota = tkn_ext_grp * res->tkn_grp_sz;
 
 		if (IS_WED_HW_CAP(wed, WED_HW_CAP_32K_TXBUF))
 			buf_lmt = res->bm_max_grp*res->bm_grp_sz;
 		else
 			buf_lmt = 8192;
 
-		size = res->pkt_num + (tkn_ext_grp * res->bm_grp_sz);
+		bm_ext_grp = min_t(u32, tkn_ext_grp, res->budget_grp);
+		size = res->pkt_num + (bm_ext_grp * res->bm_grp_sz);
 
 		warp_dbg(WARP_DBG_INF, "%s(): old packet num:%d\n", __func__, res->pkt_num);
 
-		if (size <= buf_lmt) {
-			if (bm_buf_extend(wed, wed->sw_conf->txbm.alt_quota) == 0) {
+		if (bm_ext_grp && size <= buf_lmt) {
+			res->tkn_vld_grp += tkn_ext_grp;
+
+			if (bm_buf_extend(wed, bm_ext_grp) == 0) {
 				warp_bfm_update_hw(wed, false);
 				warp_dbg(WARP_DBG_INF, "%s(): update packet num:%d(+%d packets/%d group)\n",
-						 __func__, res->pkt_num, wed->sw_conf->txbm.alt_quota*res->bm_grp_sz, wed->sw_conf->txbm.alt_quota);
+						 __func__, res->pkt_num, bm_ext_grp*res->bm_grp_sz, bm_ext_grp);
 				warp_btkn_update_hw(wed, false);
 				warp_dbg(WARP_DBG_INF, "%s(): update token num:%d(+%d tokens/%d group)\n",
 							 __func__, res->tkn_vld_grp*res->tkn_grp_sz, tkn_quota, tkn_ext_grp);
-			} else
+				wed_txbm_sanity_check(wed, "token_alloc");
+			} else {
+				res->tkn_vld_grp -= tkn_ext_grp;
 				warp_dbg(WARP_DBG_ERR, "%s(): token num remain:%d due to allocate memory failed!\n",
 						 __func__, res->tkn_vld_grp*res->tkn_grp_sz);
+			}
 		} else
 			warp_dbg(WARP_DBG_INF, "%s(): memory required exceed capability! dismissed!\n", __func__);
 	}
@@ -826,12 +931,39 @@ wed_txbm_init(struct wed_entry *wed, struct wifi_hw *hw)
 	struct wed_tx_ctrl *tx_ctrl = &wed->res_ctrl.tx_ctrl;
 	struct wed_buf_res *res = &tx_ctrl->res;
 	struct sw_conf_t *sw_conf = wed->sw_conf;
-	u32 init_grp = 0;
+	u32 init_grp = 0, token_grp_cap, token_remainder;
 	/*tx resource allocate*/
 	/* H/W capability */
-	res->tkn_max_grp = 0x40;	/* 64 groups, 8192 tokens */
 	res->bm_grp_sz = 0x80;		/* 128 packets per group */
 	res->tkn_grp_sz = 0x80;		/* 128 token per group */
+	res->token_num = hw->tx_token_nums - hw->sw_tx_token_nums;
+
+	if (unlikely(hw->tx_token_nums <= hw->sw_tx_token_nums || !res->token_num)) {
+		warp_dbg(WARP_DBG_ERR,
+			 "%s(): invalid token geometry hw=%u sw=%u\n",
+			 __func__, hw->tx_token_nums, hw->sw_tx_token_nums);
+		return -1;
+	}
+
+	token_grp_cap = wed_txbm_token_grp_cap(res);
+	if (!token_grp_cap) {
+		warp_dbg(WARP_DBG_ERR, "%s(): token group capability is zero\n", __func__);
+		return -1;
+	}
+	token_remainder = res->token_num % res->tkn_grp_sz;
+
+	res->tkn_max_grp = min_t(u32, 0x40, token_grp_cap);
+	res->tkn_rsv_grp = token_grp_cap;
+	res->tkn_vld_grp = token_grp_cap;
+	res->token_start = 0;
+	res->token_end = res->token_num - 1;
+	res->wed_token_cnt = res->token_num;
+	res->dybm_stat.near_full_warned = false;
+	if (token_remainder) {
+		warp_dbg(WARP_DBG_INF,
+			 "%s(): leave %u tail token(s) unused to keep TXBM group alignment\n",
+			 __func__, token_remainder);
+	}
 
 #ifdef WED_WDMA_SINGLE_RING
 	if (wifi_dbdc_support(wed->warp) == false)	/* dbdc_mode is false, shrink TXBM to support single wdma ring */
@@ -839,6 +971,13 @@ wed_txbm_init(struct wed_entry *wed, struct wifi_hw *hw)
 	else
 #endif
 		init_grp = ceil(sw_conf->rx_wdma_ring_depth*WDMA_RX_RING_NUM, res->bm_grp_sz);
+
+	if (init_grp > token_grp_cap) {
+		warp_dbg(WARP_DBG_ERR,
+			 "%s(): init groups exceed token capability (%u > %u)\n",
+			 __func__, init_grp, token_grp_cap);
+		return -1;
+	}
 
 #ifdef WED_DYNAMIC_TXBM_SUPPORT
 	if (sw_conf->txbm.enable == true) {
@@ -860,17 +999,17 @@ wed_txbm_init(struct wed_entry *wed, struct wifi_hw *hw)
 			res->bm_max_grp = res->bm_vld_grp;	/* the groups of packets */
 		else
 #endif
-			res->bm_max_grp = MAX_GROUP_SIZE;	/* 256 groups, 32768 packets */
+			res->bm_max_grp = min_t(u32, MAX_GROUP_SIZE, token_grp_cap);	/* 256 groups, 32768 packets */
 	} else
-		res->bm_max_grp = 0x40; 	/* 64 groups, 8192 packets */
+		res->bm_max_grp = min_t(u32, 0x40, token_grp_cap); 	/* 64 groups, 8192 packets */
 
 	if (sw_conf->txbm.max_group) {
 		/* sanity to prevent exceed H/W capability */
-		if (sw_conf->txbm.max_group > MAX_GROUP_SIZE) {
+		if (sw_conf->txbm.max_group > res->bm_max_grp) {
 			warp_dbg(WARP_DBG_ERR,
 				"%s(): TXBM exceed BM H/W cap(%d), correct to H/W cap(%d)!\n",
 				__func__, sw_conf->txbm.max_group, res->bm_max_grp);
-			sw_conf->txbm.max_group = MAX_GROUP_SIZE;
+			sw_conf->txbm.max_group = res->bm_max_grp;
 		}
 		warp_dbg(WARP_DBG_INF,"%s(): TXBM set BM H/W cap(%d), old H/W cap(%d)!\n",
 			__func__, sw_conf->txbm.max_group, res->bm_max_grp);
@@ -896,27 +1035,23 @@ wed_txbm_init(struct wed_entry *wed, struct wifi_hw *hw)
 		}
 	}
 
-	if (wed->ver >= 2)
-		res->pkt_num = res->bm_vld_grp * res->bm_grp_sz;
-	else
-		res->pkt_num = res->wed_token_cnt;
+	if (res->bm_vld_grp > res->bm_max_grp || res->bm_rsv_grp > res->bm_vld_grp) {
+		warp_dbg(WARP_DBG_ERR,
+			 "%s(): invalid group configuration rsv=%u vld=%u max=%u\n",
+			 __func__, res->bm_rsv_grp, res->bm_vld_grp, res->bm_max_grp);
+		return -1;
+	}
 
-	res->token_num = hw->tx_token_nums - hw->sw_tx_token_nums;
-	if (res->tkn_max_grp > ceil(res->token_num, res->tkn_grp_sz))
-		res->tkn_max_grp = ceil(res->token_num, res->tkn_grp_sz);
-	res->tkn_rsv_grp = (res->token_num / res->tkn_grp_sz);
-	res->tkn_vld_grp = (res->token_num / res->tkn_grp_sz);
+	wed_txbm_sync_pkt_num(res);
+	if (wed_txbm_sanity_check(wed, "init") < 0)
+		return -1;
 
-	res->token_start = 0;
-	res->token_end = (res->token_num - 1);
-
-	res->wed_token_cnt = res->token_num;
 	res->dmad_len = hw->txd_size;
 	res->fd_len = hw->fbuf_size;
 	res->pkt_len = hw->tx_pkt_size;
 	res->recycle_grp_idx = 0;
 
-	if (bm_init_all(wed, res) < 0)
+	if (bm_init_all(wed, res) < 0 || wed_txbm_sanity_check(wed, "post_alloc") < 0)
 		goto err;
 
 	return 0;

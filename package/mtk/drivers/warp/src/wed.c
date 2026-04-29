@@ -650,6 +650,12 @@ int wed_fdesc_init(
 	if (warp && info) {
 		u32 ctrl = 0;
 
+		if (unlikely(info->token_id == WED_INVALID_TOKEN_ID)) {
+			warp_dbg(WARP_DBG_ERR, "%s(): invalid token id for pkt %pad\n",
+				 __func__, &info->pkt_pa);
+			goto err;
+		}
+
 		wifi = &warp->wifi;
 
 		txdma = (struct warp_txdmad *)info->desc_va;
@@ -697,14 +703,18 @@ wed_init(struct platform_device *pdev, u8 idx, struct wed_entry *wed)
 	/*initial wed hw cap for related decision*/
 	warp_conf_hwcap(wed);
 	/*allocate ring first*/
-	wed_ring_init(wed);
+	ret = wed_ring_init(wed);
+	if (ret < 0)
+		goto err;
 	/*assign tx ring to ad*/
 	if (wed->warp)
 		warp = (struct warp_entry *)wed->warp;
 	else
 		goto err;
 #ifdef WED_HW_TX_SUPPORT
-	wed_txbm_init(wed, &warp->wifi.hw);
+	ret = wed_txbm_init(wed, &warp->wifi.hw);
+	if (ret < 0)
+		goto err;
 #endif /*WED_HW_TX_SUPPORT*/
 #ifdef WED_RX_D_SUPPORT
 	warp_wed_rro_init(wed);
