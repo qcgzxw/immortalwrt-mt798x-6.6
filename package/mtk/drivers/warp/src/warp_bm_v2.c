@@ -972,11 +972,12 @@ wed_txbm_init(struct wed_entry *wed, struct wifi_hw *hw)
 #endif
 		init_grp = ceil(sw_conf->rx_wdma_ring_depth*WDMA_RX_RING_NUM, res->bm_grp_sz);
 
+	/* Adjust init_grp to fit within token capability */
 	if (init_grp > token_grp_cap) {
 		warp_dbg(WARP_DBG_ERR,
-			 "%s(): init groups exceed token capability (%u > %u)\n",
-			 __func__, init_grp, token_grp_cap);
-		return -1;
+			 "%s(): init groups exceed token capability (%u > %u), limiting to %u\n",
+			 __func__, init_grp, token_grp_cap, token_grp_cap);
+		init_grp = token_grp_cap;
 	}
 
 #ifdef WED_DYNAMIC_TXBM_SUPPORT
@@ -989,14 +990,28 @@ wed_txbm_init(struct wed_entry *wed, struct wifi_hw *hw)
 #endif	/* WED_DYNAMIC_TXBM_SUPPORT */
 	{
 		/* once DYBM disabled, prepare BM size with rule, fullfill WDMA RX ring plus cut through token number */
-		res->bm_rsv_grp = init_grp+res->tkn_max_grp;
-		res->bm_vld_grp = init_grp+res->tkn_max_grp;
+		res->bm_rsv_grp = min_t(u32, init_grp + res->tkn_max_grp, token_grp_cap);
+		res->bm_vld_grp = min_t(u32, init_grp + res->tkn_max_grp, token_grp_cap);
+	}
+
+	if (res->bm_vld_grp > token_grp_cap) {
+		warp_dbg(WARP_DBG_ERR,
+			 "%s(): clamp TXBM valid groups from %u to token cap %u\n",
+			 __func__, res->bm_vld_grp, token_grp_cap);
+		res->bm_vld_grp = token_grp_cap;
+	}
+
+	if (res->bm_rsv_grp > res->bm_vld_grp) {
+		warp_dbg(WARP_DBG_ERR,
+			 "%s(): clamp TXBM reserved groups from %u to %u\n",
+			 __func__, res->bm_rsv_grp, res->bm_vld_grp);
+		res->bm_rsv_grp = res->bm_vld_grp;
 	}
 
 	if (wed->ver >= 2) {
 #ifdef MEMORY_SHRINK
 		if (sw_conf->txbm.enable == false)
-			res->bm_max_grp = res->bm_vld_grp;	/* the groups of packets */
+			res->bm_max_grp = min_t(u32, res->bm_vld_grp, token_grp_cap);	/* the groups of packets */
 		else
 #endif
 			res->bm_max_grp = min_t(u32, MAX_GROUP_SIZE, token_grp_cap);	/* 256 groups, 32768 packets */
